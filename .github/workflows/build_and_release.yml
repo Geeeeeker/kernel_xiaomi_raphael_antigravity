@@ -1,0 +1,240 @@
+name: Build and Release Docker Kernel
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build from'
+        required: true
+        default: 'main'
+        type: string
+      kernel_version:
+        description: 'Kernel version tag'
+        required: false
+        default: 'custom'
+        type: string
+
+env:
+  KERNEL_SOURCE_REPO: https://github.com/SOVIET-ANDROID/kernel_xiaomi_raphael
+  TOOLCHAIN_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout current repo
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.branch || 'main' }}
+        path: antigravity-configs
+    
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        repository: SOVIET-ANDROID/kernel_xiaomi_raphael
+        path: kernel_source
+        ref: android-16.0
+    
+    - name: Setup build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          bc \
+          bison \
+          flex \
+          libssl-dev \
+          libncurses5-dev \
+          git \
+          curl \
+          wget \
+          python3 \
+          python3-pip \
+          ccache \
+          cpio \
+          device-tree-compiler \
+          zip
+        
+        # Setup ccache
+        ccache -M 10G
+        ccache -s
+    
+    - name: Download and setup toolchain
+      run: |
+        mkdir -p ~/toolchains
+        cd ~/toolchains
+        wget -q ${{ env.TOOLCHAIN_URL }} -O clang-r522817.tar.gz
+        mkdir -p clang-r522817
+        tar -xzf clang-r522817.tar.gz -C clang-r522817
+        echo "TOOLCHAIN_PATH=$HOME/toolchains/clang-r522817" >> $GITHUB_ENV
+    
+    - name: Setup build configs
+      run: |
+        cd kernel_source
+        
+        # Copy docker config from antigravity configs
+        cp ../antigravity-configs/docker.config .
+        cp ../antigravity-configs/raphael_docker_defconfig arch/arm64/configs/raphael_docker_defconfig
+        
+        # Create build output directory
+        mkdir -p out
+        
+        # Setup environment
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export PATH=${{ env.TOOLCHAIN_PATH }}/bin:$PATH
+        export CC=clang
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+        export LD=${{ env.TOOLCHAIN_PATH }}/bin/ld.lld
+        export AR=llvm-ar
+        export NM=llvm-nm
+        export OBJCOPY=llvm-objcopy
+        export OBJDUMP=llvm-objdump
+        export STRIP=llvm-strip
+        export LLVM_IAS=1
+        export DTC_EXT=dtc
+        export CCACHE_DIR=$HOME/.ccache
+        export USE_CCACHE=1
+        
+        # Generate config
+        echo "Generating kernel config..."
+        make O=out ARCH=arm64 raphael_docker_defconfig
+        
+        # Merge additional configs
+        echo "Merging docker config..."
+        scripts/kconfig/merge_config.sh -m -O out out/.config docker.config
+        
+        # Resolve dependencies
+        echo "Resolving dependencies..."
+        make O=out ARCH=arm64 olddefconfig
+        
+        # Verify critical flags
+        echo "Verifying critical configs..."
+        grep -E "CONFIG_CGROUP_PIDS|CONFIG_USER_NS|CONFIG_PID_NS|CONFIG_OVERLAY_FS" out/.config
+      
+    - name: Build kernel
+      run: |
+        cd kernel_source
+        
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export PATH=${{ env.TOOLCHAIN_PATH }}/bin:$PATH
+        export CC=clang
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+        export LD=${{ env.TOOLCHAIN_PATH }}/bin/ld.lld
+        export AR=llvm-ar
+        export NM=llvm-nm
+        export OBJCOPY=llvm-objcopy
+        export OBJDUMP=llvm-objdump
+        export STRIP=llvm-strip
+        export LLVM_IAS=1
+        export DTC_EXT=dtc
+        export CCACHE_DIR=$HOME/.ccache
+        export USE_CCACHE=1
+        
+        echo "Starting kernel compilation..."
+        make O=out ARCH=arm64 -j$(nproc) 2>&1 | tee build.log
+    
+    - name: Verify build output
+      run: |
+        cd kernel_source
+        if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
+          echo "✅ Kernel Image.gz-dtb built successfully"
+          ls -lah out/arch/arm64/boot/Image.gz-dtb
+        else
+          echo "❌ Kernel Image.gz-dtb not found!"
+          exit 1
+        fi
+        
+        # Check for dtb
+        if [ -f out/arch/arm64/boot/dts/qcom/*.dtb ]; then
+          echo "✅ DTB files found"
+        fi
+    
+    - name: Create AnyKernel3 package
+      run: |
+        mkdir -p release
+        cd kernel_source
+        
+        # Copy kernel
+        cp out/arch/arm64/boot/Image.gz-dtb ../release/
+        
+        # Create modules directory if modules exist
+        if [ -d out/modules ]; then
+          mkdir -p ../release/modules
+          find out/modules -name "*.ko" -exec cp {} ../release/modules/ \;
+        fi
+        
+        # Copy config
+        cp out/.config ../release/kernel_config.txt
+        
+        cd ../release
+        
+        # Create release info
+        echo "Build Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" > release_info.txt
+        echo "Kernel Source: ${{ env.KERNEL_SOURCE_REPO }}" >> release_info.txt
+        echo "Toolchain: Clang 18.0.1 (r522817)" >> release_info.txt
+        echo "Build ID: ${{ github.run_id }}" >> release_info.txt
+        
+        # Create zip package
+        zip -r Kernel-Docker-Raphael-$(date +%Y%m%d).zip *
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-build-output
+        path: |
+          release/*
+          kernel_source/build.log
+          kernel_source/out/.config
+        retention-days: 30
+    
+    - name: Create Release
+      if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: release/Kernel-Docker-Raphael-*.zip
+        generate_release_notes: true
+        tag_name: ${{ github.ref_name }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Upload to Release (manual dispatch)
+      if: github.event_name == 'workflow_dispatch'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: release/Kernel-Docker-Raphael-*.zip
+        tag_name: ${{ github.event.inputs.kernel_version || 'latest' }}
+        generate_release_notes: true
+        prerelease: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  notify:
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - name: Summary
+      run: |
+        echo "## Build Result: ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Build ID: ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Trigger: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Branch: ${{ github.ref }}" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ needs.build.result }}" == "success" ]; then
+          echo "- ✅ Kernel built successfully" >> $GITHUB_STEP_SUMMARY
+          echo "- 📦 Artifacts available in build output" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- ❌ Build failed. Check logs for details." >> $GITHUB_STEP_SUMMARY
+        fi
