@@ -1,111 +1,96 @@
-name: Official Docker Kernel Build (16.0-SUSFS / clang-r547379)
+name: Optimized Kernel Build for Redmi K20 Pro
 
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*.*.*' ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: '内核源码分支'
+        required: true
+        default: '16.0-SUSFS'
+        type: string
 
 env:
-  # ---- 固定配置 ----
   KERNEL_SOURCE_REPO: https://github.com/SOVIET-ANDROID/kernel_xiaomi_raphael
-  KERNEL_BRANCH: 16.0-SUSFS
-  TOOLCHAIN_TARBALL_URL: https://github.com/Geeeeeker/boot/releases/download/clang-prebuilts-20260319-031015/clang-r547379.tar.gz
+  TOOLCHAIN_URL: https://github.com/Geeeeeker/boot/releases/download/clang-prebuilts-20260319-031015/clang-r547379.tar.gz
   TOOLCHAIN_DIR_NAME: clang-r547379
 
 jobs:
-  build-with-official-docker:
+  build:
     runs-on: ubuntu-latest
-    # Docker 构建方式本身需要较长时间（官方预计 10-20 分钟），请预留足够时间
-    timeout-minutes: 60
+    # 使用轻量级Debian镜像作为执行环境，避免依赖冲突
+    container:
+      image: debian:bookworm-slim
 
     steps:
-      # 1. 检出你自己的配置文件 (包含 Dockerfile 和 build_docker.sh)
-      - name: Checkout antigravity configs
+      # 1. 检出你当前的Kernel配置仓库
+      - name: 检出 antigravity 配置
         uses: actions/checkout@v4
         with:
           path: antigravity-configs
-          fetch-depth: 1
 
-      # 2. 检出要编译的内核源码 (16.0-SUSFS 分支)
-      - name: Checkout kernel source
+      # 2. 检出SOVIET-ANDROID内核源码，明确指定分支为 16.0-SUSFS
+      - name: 检出内核源码
         uses: actions/checkout@v4
         with:
           repository: SOVIET-ANDROID/kernel_xiaomi_raphael
           path: kernel_source
-          ref: ${{ env.KERNEL_BRANCH }}
-          fetch-depth: 1
+          ref: 16.0-SUSFS  # 显式指定分支名
 
-      # 3. 下载 clang-r547379 工具链到宿主机
-      - name: Download toolchain
+      # 3. 安装编译所需的基础工具链
+      - name: 安装基础依赖
         run: |
-          echo ">>> 正在下载 clang-r547379 工具链 ..."
+          apt-get update -qq
+          apt-get install -y -qq \
+            build-essential bc bison flex libssl-dev \
+            libncurses5-dev git curl wget ca-certificates \
+            python3 ccache cpio xz-utils lld llvm
+          # 清理缓存减小体积
+          rm -rf /var/lib/apt/lists/*
+
+      # 4. 下载并配置指定的clang工具链
+      - name: 配置编译工具链
+        run: |
+          echo ">>> 下载 clang-r547379..."
           mkdir -p /opt/android-kernel
-          wget -q --show-progress "${{ env.TOOLCHAIN_TARBALL_URL }}" -O /opt/android-kernel/toolchain.tar.gz
-          mkdir -p /opt/android-kernel/${{ env.TOOLCHAIN_DIR_NAME }}
-          tar -xzf /opt/android-kernel/toolchain.tar.gz -C /opt/android-kernel/${{ env.TOOLCHAIN_DIR_NAME }}
-          echo ">>> 工具链已就绪。"
+          wget -q --show-progress "${TOOLCHAIN_URL}" -O /opt/android-kernel/toolchain.tar.gz
+          tar -xzf /opt/android-kernel/toolchain.tar.gz -C /opt/android-kernel/${TOOLCHAIN_DIR_NAME}
+          echo ">>> 工具链已就绪"
+          # 验证工具链
+          /opt/android-kernel/${TOOLCHAIN_DIR_NAME}/bin/clang --version
 
-      # 4. 准备 Docker 构建环境 (Dockerfile 来自你的仓库)
-      - name: Prepare Docker build environment
+      # 5. 编译内核
+      - name: 编译内核
         run: |
-          echo ">>> 复制构建脚本和配置 ..."
-          cp antigravity-configs/Dockerfile kernel_source/
-          cp antigravity-configs/build_docker.sh kernel_source/
-          # 确保 docker.config 存在 (你的仓库里应该有)
-          cp antigravity-configs/docker.config kernel_source/ 2>/dev/null || echo ">>> 未找到 docker.config，将使用内核自带的 defconfig。"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="/opt/android-kernel/${TOOLCHAIN_DIR_NAME}/bin:${PATH}"
+          export CC=clang
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export LD=ld.lld
 
-      # 5. 构建 Docker 镜像 (按照 BUILD.md 中的官方步骤)
-      - name: Build the Docker image
-        run: |
-          echo ">>> 正在构建 Docker 镜像 (android-kernel-builder) ..."
           cd kernel_source
-          docker build -t android-kernel-builder .
-          echo ">>> 镜像构建完成。"
+          make O=out ARCH=arm64 raphael_docker_defconfig
+          make O=out ARCH=arm64 olddefconfig
+          
+          echo ">>> 开始编译内核..."
+          make O=out ARCH=arm64 -j$(nproc) 2>&1 | tee build.log
+          
+          # 检查编译产物
+          if [ ! -f out/arch/arm64/boot/Image.gz-dtb ]; then
+            echo "::error::编译失败，未找到 Image.gz-dtb"
+            exit 1
+          fi
+          echo ">>> 编译成功！"
 
-      # 6. 在 Docker 容器内执行官方编译
-      - name: Run kernel build inside Docker
-        run: |
-          echo ">>> 在 Docker 容器内启动内核编译 ..."
-          # 完全按照 BUILD.md 中的 Docker run 逻辑：
-          # 将内核源码和工具链挂载进容器，并运行 build_docker.sh
-          docker run --rm \
-            --name soviet-kernel-builder \
-            -v ${{ github.workspace }}/kernel_source:/kernel/soviet_kernel_stock \
-            -v /opt/android-kernel/${{ env.TOOLCHAIN_DIR_NAME }}:/opt/clang \
-            --tmpfs /tmp/build:rw,size=4G,mode=1777 \
-            android-kernel-builder \
-            bash /kernel/soviet_kernel_stock/build_docker.sh
-          echo ">>> Docker 编译流程结束。"
-
-      # 7. 归档编译产物 (Image.gz-dtb)
-      - name: Create release artifact
-        run: |
-          echo ">>> 正在准备发布包 ..."
-          mkdir -p release
-          # 编译产物路径与 build_docker.sh 输出对应
-          cp kernel_source/out/arch/arm64/boot/Image.gz-dtb release/
-          cp kernel_source/out/.config release/kernel_config.txt
-          cd release
-          zip -r Kernel-Docker-Official-$(date +%Y%m%d-%H%M).zip .
-          echo ">>> 发布包已生成。"
-        shell: bash
-
-      # 8. 上传构建产物
-      - name: Upload artifact
+      # 6. 打包并上传编译产物
+      - name: 上传内核镜像
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-docker-official-build-${{ github.run_id }}
-          path: release/Kernel-Docker-Official-*.zip
-
-      # 9. (可选) 将产物发布到 Release 页面
-      - name: Create Release (on tag push)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v1
-        with:
-          files: release/Kernel-Docker-Official-*.zip
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: kernel-image
+          path: kernel_source/out/arch/arm64/boot/Image.gz-dtb
